@@ -1,0 +1,19 @@
+services:
+  screenshoter:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Override in .env or here.
+      BROWSER_MAX_CONCURRENT: "5"
+    # Playwright needs /dev/shm; the default 64 MB is too small for Chromium.
+    shm_size: "1gb"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
