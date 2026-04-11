@@ -4,8 +4,9 @@ Screenshot microservice — FastAPI entry point.
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Depends, HTTPException, Request, status
+from fastapi import FastAPI, Depends, HTTPException, Request, Security, status
 from fastapi.responses import Response
+from fastapi.security import APIKeyHeader
 
 from .config import settings
 from .middleware import rate_limit
@@ -47,10 +48,12 @@ app = FastAPI(
 # Auth dependency (no-op when API_KEY is not set)
 # ---------------------------------------------------------------------------
 
-def require_api_key(request: Request) -> None:
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_api_key(key: str | None = Security(_api_key_header)) -> None:
     if not settings.api_key:
         return
-    key = request.headers.get("X-API-Key", "")
     if key != settings.api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
