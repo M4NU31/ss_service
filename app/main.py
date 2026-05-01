@@ -24,10 +24,10 @@ engine = ScreenshotEngine()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    import asyncio
-    await asyncio.to_thread(engine.start)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, engine.start)
     yield
-    await asyncio.to_thread(engine.stop)
+    await loop.run_in_executor(None, engine.stop)
 
 
 # ---------------------------------------------------------------------------

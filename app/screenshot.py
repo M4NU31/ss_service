@@ -1,21 +1,28 @@
 """
-Screenshot engine — sync Playwright in a thread pool.
+Screenshot engine — sync Playwright in a dedicated single thread.
 
-Why sync instead of async Playwright:
-  Python 3.14 on Windows broke asyncio subprocess spawning (the mechanism
-  async Playwright uses to launch the browser). The sync API runs the browser
-  in its own OS thread and is unaffected. FastAPI awaits each request via
-  asyncio.to_thread(), so the async interface is preserved end-to-end.
+Why a single dedicated thread instead of asyncio.to_thread():
+  sync_playwright uses greenlets that are bound to the thread where they
+  were created. asyncio.to_thread() dispatches to a random thread-pool
+  thread, causing "Cannot switch to a different thread" errors when the
+  browser restarts or operations land on a different thread than startup.
+
+  A ThreadPoolExecutor(max_workers=1) guarantees all Playwright calls
+  always run in the same persistent thread, eliminating the greenlet
+  cross-thread issue entirely.
 
 Design:
+  - One persistent thread for all Playwright work.
   - One browser process shared across all requests.
   - One fresh browser context per request (isolated cookies/cache/storage).
-  - threading.Semaphore caps concurrent contexts to avoid OOM.
   - Contexts are always closed in a finally block.
+  - On browser crash, both playwright and browser are restarted in-thread.
 """
 
+import asyncio
 import io
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image, ImageDraw
 from playwright.sync_api import sync_playwright, Browser, Playwright
@@ -27,118 +34,114 @@ from .schemas import PageScreenshotRequest, TaskScreenshotRequest
 class ScreenshotEngine:
 
     def __init__(self) -> None:
+        # Single-thread executor — all Playwright calls run in this one thread.
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="playwright")
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
-        self._semaphore: threading.Semaphore | None = None
-        self._browser_lock = threading.Lock()
 
     # ------------------------------------------------------------------
-    # Lifecycle (called via asyncio.to_thread from the FastAPI lifespan)
+    # Lifecycle
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        self._playwright = sync_playwright().start()
-        self._browser = self._launch_browser()
-        self._semaphore = threading.Semaphore(settings.browser_max_concurrent)
+        future = self._executor.submit(self._start_sync)
+        future.result()
 
     def stop(self) -> None:
-        if self._browser:
-            self._browser.close()
-        if self._playwright:
-            self._playwright.stop()
+        future = self._executor.submit(self._stop_sync)
+        future.result(timeout=10)
+        self._executor.shutdown(wait=False)
 
-    def _launch_browser(self) -> Browser:
+    def _start_sync(self) -> None:
+        self._playwright = sync_playwright().start()
+        self._browser = self._launch_browser_sync()
+
+    def _stop_sync(self) -> None:
+        try:
+            if self._browser:
+                self._browser.close()
+        except Exception:
+            pass
+        try:
+            if self._playwright:
+                self._playwright.stop()
+        except Exception:
+            pass
+
+    def _launch_browser_sync(self) -> Browser:
         launcher = getattr(self._playwright, settings.browser_engine)
         return launcher.launch(headless=True, args=settings.browser_args)
 
-    def _ensure_browser(self) -> None:
-        """Restart the browser process if it has crashed or disconnected."""
-        if self._browser and self._browser.is_connected():
-            return
-        with self._browser_lock:
-            # Re-check inside the lock — another thread may have restarted it.
-            if self._browser and self._browser.is_connected():
-                return
-            try:
-                self._browser.close()
-            except Exception:
-                pass
-            self._browser = self._launch_browser()
+    def _restart_sync(self) -> None:
+        """Restart playwright + browser entirely within the dedicated thread."""
+        self._stop_sync()
+        self._playwright = sync_playwright().start()
+        self._browser = self._launch_browser_sync()
 
     # ------------------------------------------------------------------
-    # Public API  (sync — each called via asyncio.to_thread)
+    # Sync workers (always run inside self._executor)
     # ------------------------------------------------------------------
-
-    def _force_browser_restart(self) -> None:
-        """Kill the current browser and clear the reference so _ensure_browser relaunches it."""
-        with self._browser_lock:
-            try:
-                if self._browser:
-                    self._browser.close()
-            except Exception:
-                pass
-            self._browser = None
 
     def _page_screenshot_sync(self, req: PageScreenshotRequest) -> bytes:
         last_exc: Exception | None = None
         for attempt in range(2):
-            self._ensure_browser()
+            if not (self._browser and self._browser.is_connected()):
+                self._restart_sync()
             try:
-                with self._semaphore:
-                    ctx = self._browser.new_context(
-                        viewport={"width": req.viewport.width, "height": req.viewport.height},
+                ctx = self._browser.new_context(
+                    viewport={"width": req.viewport.width, "height": req.viewport.height},
+                )
+                try:
+                    page = ctx.new_page()
+                    self._navigate(page, str(req.url))
+                    if req.delay_ms:
+                        page.wait_for_timeout(req.delay_ms)
+                    raw = page.screenshot(
+                        full_page=req.full_page,
+                        type="png",
+                        animations="disabled",
                     )
-                    try:
-                        page = ctx.new_page()
-                        self._navigate(page, str(req.url))
-                        if req.delay_ms:
-                            page.wait_for_timeout(req.delay_ms)
-                        raw = page.screenshot(
-                            full_page=req.full_page,
-                            type="png",
-                            animations="disabled",
-                        )
-                    finally:
-                        ctx.close()
+                finally:
+                    ctx.close()
                 return _encode(raw, req.format, req.quality)
             except Exception as exc:
                 last_exc = exc
-                self._force_browser_restart()
+                self._restart_sync()
         raise RuntimeError(f"Screenshot failed after retry: {last_exc}") from last_exc
 
     def _task_screenshot_sync(self, req: TaskScreenshotRequest) -> bytes:
         last_exc: Exception | None = None
         for attempt in range(2):
-            self._ensure_browser()
+            if not (self._browser and self._browser.is_connected()):
+                self._restart_sync()
             try:
-                with self._semaphore:
-                    ctx = self._browser.new_context(
-                        viewport={"width": req.viewport.width, "height": req.viewport.height},
-                    )
-                    try:
-                        page = ctx.new_page()
-                        self._navigate(page, str(req.url))
+                ctx = self._browser.new_context(
+                    viewport={"width": req.viewport.width, "height": req.viewport.height},
+                )
+                try:
+                    page = ctx.new_page()
+                    self._navigate(page, str(req.url))
 
-                        if req.scroll:
-                            page.evaluate(
-                                "([x, y]) => window.scrollTo(x, y)",
-                                [req.scroll.x, req.scroll.y],
-                            )
-                            try:
-                                page.wait_for_load_state("networkidle", timeout=5000)
-                            except Exception:
-                                page.wait_for_timeout(800)
-
-                        if req.delay_ms:
-                            page.wait_for_timeout(req.delay_ms)
-
-                        raw = page.screenshot(
-                            full_page=False,
-                            type="png",
-                            animations="disabled",
+                    if req.scroll:
+                        page.evaluate(
+                            "([x, y]) => window.scrollTo(x, y)",
+                            [req.scroll.x, req.scroll.y],
                         )
-                    finally:
-                        ctx.close()
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=5000)
+                        except Exception:
+                            page.wait_for_timeout(800)
+
+                    if req.delay_ms:
+                        page.wait_for_timeout(req.delay_ms)
+
+                    raw = page.screenshot(
+                        full_page=False,
+                        type="png",
+                        animations="disabled",
+                    )
+                finally:
+                    ctx.close()
 
                 img = Image.open(io.BytesIO(raw))
                 crop_w = req.crop_size.width if req.crop_size else settings.task_crop_width
@@ -152,7 +155,7 @@ class ScreenshotEngine:
                 return _encode_pil(img, req.format, req.quality)
             except Exception as exc:
                 last_exc = exc
-                self._force_browser_restart()
+                self._restart_sync()
         raise RuntimeError(f"Screenshot failed after retry: {last_exc}") from last_exc
 
     # ------------------------------------------------------------------
@@ -160,12 +163,12 @@ class ScreenshotEngine:
     # ------------------------------------------------------------------
 
     async def page_screenshot(self, req: PageScreenshotRequest) -> bytes:
-        import asyncio
-        return await asyncio.to_thread(self._page_screenshot_sync, req)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self._executor, self._page_screenshot_sync, req)
 
     async def task_screenshot(self, req: TaskScreenshotRequest) -> bytes:
-        import asyncio
-        return await asyncio.to_thread(self._task_screenshot_sync, req)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self._executor, self._task_screenshot_sync, req)
 
     # ------------------------------------------------------------------
     # Internal
