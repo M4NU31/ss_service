@@ -30,6 +30,7 @@ class ScreenshotEngine:
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._semaphore: threading.Semaphore | None = None
+        self._browser_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle (called via asyncio.to_thread from the FastAPI lifespan)
@@ -37,11 +38,7 @@ class ScreenshotEngine:
 
     def start(self) -> None:
         self._playwright = sync_playwright().start()
-        launcher = getattr(self._playwright, settings.browser_engine)
-        self._browser = launcher.launch(
-            headless=True,
-            args=settings.browser_args,
-        )
+        self._browser = self._launch_browser()
         self._semaphore = threading.Semaphore(settings.browser_max_concurrent)
 
     def stop(self) -> None:
@@ -50,11 +47,30 @@ class ScreenshotEngine:
         if self._playwright:
             self._playwright.stop()
 
+    def _launch_browser(self) -> Browser:
+        launcher = getattr(self._playwright, settings.browser_engine)
+        return launcher.launch(headless=True, args=settings.browser_args)
+
+    def _ensure_browser(self) -> None:
+        """Restart the browser process if it has crashed or disconnected."""
+        if self._browser and self._browser.is_connected():
+            return
+        with self._browser_lock:
+            # Re-check inside the lock — another thread may have restarted it.
+            if self._browser and self._browser.is_connected():
+                return
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+            self._browser = self._launch_browser()
+
     # ------------------------------------------------------------------
     # Public API  (sync — each called via asyncio.to_thread)
     # ------------------------------------------------------------------
 
     def _page_screenshot_sync(self, req: PageScreenshotRequest) -> bytes:
+        self._ensure_browser()
         with self._semaphore:
             ctx = self._browser.new_context(
                 viewport={"width": req.viewport.width, "height": req.viewport.height},
@@ -74,6 +90,7 @@ class ScreenshotEngine:
         return _encode(raw, req.format, req.quality)
 
     def _task_screenshot_sync(self, req: TaskScreenshotRequest) -> bytes:
+        self._ensure_browser()
         with self._semaphore:
             ctx = self._browser.new_context(
                 viewport={"width": req.viewport.width, "height": req.viewport.height},
