@@ -69,70 +69,91 @@ class ScreenshotEngine:
     # Public API  (sync — each called via asyncio.to_thread)
     # ------------------------------------------------------------------
 
-    def _page_screenshot_sync(self, req: PageScreenshotRequest) -> bytes:
-        self._ensure_browser()
-        with self._semaphore:
-            ctx = self._browser.new_context(
-                viewport={"width": req.viewport.width, "height": req.viewport.height},
-            )
+    def _force_browser_restart(self) -> None:
+        """Kill the current browser and clear the reference so _ensure_browser relaunches it."""
+        with self._browser_lock:
             try:
-                page = ctx.new_page()
-                self._navigate(page, str(req.url))
-                if req.delay_ms:
-                    page.wait_for_timeout(req.delay_ms)
-                raw = page.screenshot(
-                    full_page=req.full_page,
-                    type="png",
-                    animations="disabled",
-                )
-            finally:
-                ctx.close()
-        return _encode(raw, req.format, req.quality)
+                if self._browser:
+                    self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+
+    def _page_screenshot_sync(self, req: PageScreenshotRequest) -> bytes:
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            self._ensure_browser()
+            try:
+                with self._semaphore:
+                    ctx = self._browser.new_context(
+                        viewport={"width": req.viewport.width, "height": req.viewport.height},
+                    )
+                    try:
+                        page = ctx.new_page()
+                        self._navigate(page, str(req.url))
+                        if req.delay_ms:
+                            page.wait_for_timeout(req.delay_ms)
+                        raw = page.screenshot(
+                            full_page=req.full_page,
+                            type="png",
+                            animations="disabled",
+                        )
+                    finally:
+                        ctx.close()
+                return _encode(raw, req.format, req.quality)
+            except Exception as exc:
+                last_exc = exc
+                self._force_browser_restart()
+        raise RuntimeError(f"Screenshot failed after retry: {last_exc}") from last_exc
 
     def _task_screenshot_sync(self, req: TaskScreenshotRequest) -> bytes:
-        self._ensure_browser()
-        with self._semaphore:
-            ctx = self._browser.new_context(
-                viewport={"width": req.viewport.width, "height": req.viewport.height},
-            )
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            self._ensure_browser()
             try:
-                page = ctx.new_page()
-                self._navigate(page, str(req.url))
-
-                if req.scroll:
-                    page.evaluate(
-                        "([x, y]) => window.scrollTo(x, y)",
-                        [req.scroll.x, req.scroll.y],
+                with self._semaphore:
+                    ctx = self._browser.new_context(
+                        viewport={"width": req.viewport.width, "height": req.viewport.height},
                     )
-                    # Wait for the browser to repaint and for any lazy-loaded
-                    # content triggered by the scroll to finish loading.
                     try:
-                        page.wait_for_load_state("networkidle", timeout=5000)
-                    except Exception:
-                        page.wait_for_timeout(800)
+                        page = ctx.new_page()
+                        self._navigate(page, str(req.url))
 
-                # delay_ms runs after scroll so it applies to the final position.
-                if req.delay_ms:
-                    page.wait_for_timeout(req.delay_ms)
+                        if req.scroll:
+                            page.evaluate(
+                                "([x, y]) => window.scrollTo(x, y)",
+                                [req.scroll.x, req.scroll.y],
+                            )
+                            try:
+                                page.wait_for_load_state("networkidle", timeout=5000)
+                            except Exception:
+                                page.wait_for_timeout(800)
 
-                raw = page.screenshot(
-                    full_page=False,
-                    type="png",
-                    animations="disabled",
-                )
-            finally:
-                ctx.close()
+                        if req.delay_ms:
+                            page.wait_for_timeout(req.delay_ms)
 
-        img = Image.open(io.BytesIO(raw))
-        crop_w = req.crop_size.width if req.crop_size else settings.task_crop_width
-        crop_h = req.crop_size.height if req.crop_size else settings.task_crop_height
+                        raw = page.screenshot(
+                            full_page=False,
+                            type="png",
+                            animations="disabled",
+                        )
+                    finally:
+                        ctx.close()
 
-        if req.highlight:
-            img = _draw_crosshair(img, req.x, req.y)
-        else:
-            img = _crop_around(img, req.x, req.y, crop_w, crop_h)
+                img = Image.open(io.BytesIO(raw))
+                crop_w = req.crop_size.width if req.crop_size else settings.task_crop_width
+                crop_h = req.crop_size.height if req.crop_size else settings.task_crop_height
 
-        return _encode_pil(img, req.format, req.quality)
+                if req.highlight:
+                    img = _draw_crosshair(img, req.x, req.y)
+                else:
+                    img = _crop_around(img, req.x, req.y, crop_w, crop_h)
+
+                return _encode_pil(img, req.format, req.quality)
+            except Exception as exc:
+                last_exc = exc
+                self._force_browser_restart()
+        raise RuntimeError(f"Screenshot failed after retry: {last_exc}") from last_exc
 
     # ------------------------------------------------------------------
     # Async wrappers (called by FastAPI endpoint handlers)
