@@ -149,10 +149,10 @@ class ScreenshotEngine:
                             req.viewport.height,
                         )
 
-                        page.evaluate(
-                            "([x, y]) => window.scrollTo(x, y)",
-                            [req.scroll.x, req.scroll.y],
-                        )
+                        # Final scroll to the user's actual position, using
+                        # the force-scroll path so smooth-scroll libraries
+                        # don't animate to it (we'd screenshot mid-animation).
+                        _force_scroll_to(page, req.scroll.y)
 
                     if req.delay_ms:
                         page.wait_for_timeout(req.delay_ms)
@@ -362,10 +362,9 @@ def _sweep_element_through_center(
     IntersectionObserver-based reveal patterns (threshold 0.5+, rootMargin,
     "in-view" libraries) fire their callback before we settle the page.
 
-    Without this, elements at the bottom of the user's viewport — barely
-    peeking in — never trigger their reveal animation on the server,
-    even though the user can see them on their browser (where they were
-    revealed earlier when scrolled past a higher position).
+    Uses _force_scroll_to so smooth-scroll libraries (Lenis, Locomotive)
+    don't intercept and animate — we need an instant jump for the IO to
+    fire deterministically.
     """
     if not element_rect:
         return
@@ -383,11 +382,45 @@ def _sweep_element_through_center(
         if abs(centered_scroll_y - user_scroll_y) < 100:
             return
 
-        page.evaluate("(y) => window.scrollTo(0, y)", centered_scroll_y)
-        # Brief settle so IO callbacks run + JS-driven class toggles propagate
-        page.wait_for_timeout(80)
+        _force_scroll_to(page, centered_scroll_y)
+        # 200ms covers most throttled scroll listeners (typical 100-150ms)
+        # and gives IntersectionObserver callbacks + reveal classes time to
+        # propagate. The CSS-killer makes any resulting transitions instant.
+        page.wait_for_timeout(200)
     except Exception:
         # Non-fatal: best-effort optimization
+        pass
+
+
+# Forces the scroll position past smooth-scroll libraries (Lenis, Locomotive,
+# GSAP ScrollSmoother). These hijack window.scrollTo to animate, which means
+# we'd screenshot mid-animation. Three layers of force:
+#
+#   1. Try the library's own API via common global names if present.
+#   2. Direct property assignment on documentElement/body bypasses scrollTo.
+#   3. Standard scrollTo in case 1 and 2 didn't apply.
+#   4. Dispatch a synthetic scroll event to wake any throttled listeners.
+_FORCE_SCROLL_JS = """
+(targetY) => {
+  const lenis = window.lenis || window.__lenis || window._lenis;
+  if (lenis && typeof lenis.scrollTo === 'function') {
+    try { lenis.scrollTo(targetY, { immediate: true, force: true, lock: true }); } catch (e) {}
+    if (lenis.scroll != null) lenis.scroll = targetY;
+    if (typeof lenis.stop === 'function') { try { lenis.stop(); } catch (e) {} }
+  }
+  document.documentElement.scrollTop = targetY;
+  document.body.scrollTop = targetY;
+  window.scrollTo(0, targetY);
+  window.dispatchEvent(new Event('scroll'));
+  document.dispatchEvent(new Event('scroll'));
+}
+"""
+
+
+def _force_scroll_to(page, y: int) -> None:
+    try:
+        page.evaluate(_FORCE_SCROLL_JS, y)
+    except Exception:
         pass
 
 
