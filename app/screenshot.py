@@ -142,11 +142,15 @@ class ScreenshotEngine:
                     if req.delay_ms:
                         page.wait_for_timeout(req.delay_ms)
 
-                    # Resolve the pin position. If a selector was provided and
-                    # the element is found server-side, use its actual visual
-                    # position — much more reliable than the user-reported
-                    # (x, y) on sites where server rendering differs.
-                    pin_x, pin_y = _resolve_pin_position(page, req)
+                    # If we have a selector, align the scroll so the element
+                    # ends up at the same viewport y the user reported. Smooth-
+                    # scroll libraries can leave the page mid-flight; this
+                    # final correction snaps the element into place by
+                    # adjusting scroll by the delta between the element's
+                    # actual viewport y and the requested y. Pin still draws
+                    # at user-reported (x, y) — that's exactly where they clicked.
+                    if req.selector:
+                        _align_scroll_to_element(page, req)
 
                     raw = page.screenshot(
                         full_page=False,
@@ -161,9 +165,9 @@ class ScreenshotEngine:
                 crop_h = req.crop_size.height if req.crop_size else settings.task_crop_height
 
                 if req.highlight:
-                    img = _draw_pin(img, pin_x, pin_y)
+                    img = _draw_pin(img, req.x, req.y)
                 else:
-                    img = _crop_around(img, pin_x, pin_y, crop_w, crop_h)
+                    img = _crop_around(img, req.x, req.y, crop_w, crop_h)
 
                 return _encode_pil(img, req.format, req.quality)
             except Exception as exc:
@@ -272,63 +276,64 @@ html, body {
 """
 
 
-def _resolve_pin_position(page, req: "TaskScreenshotRequest") -> tuple[int, int]:
+def _align_scroll_to_element(page, req: "TaskScreenshotRequest") -> None:
     """
-    Determine where to draw the pin on the captured viewport.
+    Compensate for scroll-position drift. Compares the clicked element's
+    bounding-rect top on the server vs. the client's reported top:
 
-    If a selector was provided and the element is currently visible in the
-    viewport, return its actual bounding-box center. This is much more
-    reliable than the client-reported (x, y) because:
+        delta = server_top - client_top
+        scrollBy(0, delta)
 
-      - Server rendering may differ from the user's browser (font load
-        timing, image dimensions, smooth-scroll libraries that animate
-        scrollTo even though we asked for instant).
-      - The element's true viewport position after the server's scroll
-        is whatever the layout decided, not what the client predicted.
+    After this, the element appears at the same viewport y as on the
+    client, regardless of whether the smooth-scroll library finished its
+    animation, font swaps shifted layout, etc.
 
-    Falls back to the client-reported (x, y) when:
-      - No selector provided
-      - Selector doesn't match anything on the server-side DOM
-      - Element is outside the viewport (e.g. its position is so different
-        that following it would crop the wrong region)
+    The pin still draws at the user's reported (x, y) — that's the point
+    they actually clicked. We're only correcting WHAT'S SHOWN at that
+    point, not where the pin goes.
     """
-    selector = req.selector
-    if not selector:
-        return req.x, req.y
+    selector     = req.selector
+    client_rect  = req.element_rect
+    if not selector or not client_rect or "top" not in client_rect:
+        return
 
     try:
-        # Strip pseudo-element suffix; query_selector won't match those
         sel = selector.split("::")[0].strip()
         if not sel:
-            return req.x, req.y
+            return
 
-        rect = page.evaluate(
+        server_top = page.evaluate(
             """
             (sel) => {
                 const el = document.querySelector(sel);
                 if (!el) return null;
-                const r = el.getBoundingClientRect();
-                return { left: r.left, top: r.top, width: r.width, height: r.height };
+                return el.getBoundingClientRect().top;
             }
             """,
             sel,
         )
     except Exception:
-        return req.x, req.y
+        return
 
-    if not rect:
-        return req.x, req.y
+    if server_top is None:
+        return
 
-    cx = int(rect["left"] + rect["width"] / 2)
-    cy = int(rect["top"]  + rect["height"] / 2)
+    delta = server_top - client_rect["top"]
 
-    # Reject if the element ended up outside the viewport — likely a layout
-    # mismatch where server rendering put it somewhere different. Better to
-    # mark the user's reported click point than to point off-screen.
-    if cx < 0 or cy < 0 or cx >= req.viewport.width or cy >= req.viewport.height:
-        return req.x, req.y
+    # Sanity check: if the element ended up wildly off, don't try to
+    # chase it — likely a server/client layout mismatch we can't fix
+    # with scroll adjustment.
+    if abs(delta) > req.viewport.height:
+        return
+    # Skip negligible drift
+    if abs(delta) < 4:
+        return
 
-    return cx, cy
+    try:
+        page.evaluate("(dy) => window.scrollBy(0, dy)", delta)
+        page.wait_for_timeout(50)
+    except Exception:
+        pass
 
 
 def _prefire_observers(page, target_y: int) -> None:

@@ -57,13 +57,17 @@ class TaskScreenshotRequest(BaseModel):
     # Coordinates here are page (document) coordinates in pixels.
     scroll: ScrollPosition | None = None
 
-    # Optional: CSS selector of the clicked element. When provided and the
-    # element is found server-side, the pin is drawn at the element's actual
-    # viewport position (not the user-reported (x, y)). Fixes pin imprecision
-    # on sites where server rendering differs from the client (smooth scroll
-    # libraries like Lenis interpreting scrollTo as animated, image lazy
-    # loading, font swaps, etc.).
+    # Optional: CSS selector of the clicked element. When provided together
+    # with element_rect, ss_service compares the element's server-side
+    # bounding rect to the client's rect and adjusts scroll so the element
+    # ends up at the same viewport y the user saw — fixing imprecision on
+    # smooth-scroll sites (Lenis, Locomotive) where window.scrollTo lands
+    # mid-animation.
     selector: str | None = None
+
+    # Optional: getBoundingClientRect() of the clicked element at click time
+    # on the client. {top, left, width, height} in client viewport coords.
+    element_rect: dict | None = None
 
     # Region to crop around (x, y). Omit to use the service default.
     crop_size: CropSize | None = None
