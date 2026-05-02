@@ -21,7 +21,6 @@ Design:
 
 import asyncio
 import io
-import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image, ImageDraw
@@ -122,7 +121,20 @@ class ScreenshotEngine:
                     page = ctx.new_page()
                     self._navigate(page, str(req.url))
 
+                    # Kill all CSS animations & transitions before they paint.
+                    # More aggressive than Playwright's animations="disabled"
+                    # (which only freezes them at screenshot time) — every
+                    # element starts directly in its final state.
+                    page.add_style_tag(content=_ANIMATION_KILL_CSS)
+
                     if req.scroll:
+                        # Pre-fire IntersectionObservers by scrolling through
+                        # the page first. Sites with reveal-on-scroll patterns
+                        # (very common) keep elements at opacity:0 / pre-transform
+                        # until their IO callback fires. Without this prefire,
+                        # those elements render blank.
+                        _prefire_observers(page, req.scroll.y)
+
                         page.evaluate(
                             "([x, y]) => window.scrollTo(x, y)",
                             [req.scroll.x, req.scroll.y],
@@ -130,7 +142,7 @@ class ScreenshotEngine:
                         try:
                             page.wait_for_load_state("networkidle", timeout=5000)
                         except Exception:
-                            page.wait_for_timeout(800)
+                            page.wait_for_timeout(500)
 
                     if req.delay_ms:
                         page.wait_for_timeout(req.delay_ms)
@@ -148,7 +160,7 @@ class ScreenshotEngine:
                 crop_h = req.crop_size.height if req.crop_size else settings.task_crop_height
 
                 if req.highlight:
-                    img = _draw_crosshair(img, req.x, req.y)
+                    img = _draw_pin(img, req.x, req.y)
                 else:
                     img = _crop_around(img, req.x, req.y, crop_w, crop_h)
 
@@ -198,21 +210,81 @@ def _crop_around(img: Image.Image, cx: int, cy: int, crop_w: int, crop_h: int) -
     return img.crop((left, top, right, bottom))
 
 
-def _draw_crosshair(
+def _draw_pin(
     img: Image.Image,
     cx: int, cy: int,
-    radius: int = 14,
-    line_len: int = 22,
-    color: tuple = (220, 30, 30, 230),
-    width: int = 2,
+    radius: int = 11,
+    color: tuple = (255, 8, 79, 230),       # hsl(348, 100%, 52%) ≈ punchbug red
+    inner_color: tuple = (255, 255, 255, 230),
 ) -> Image.Image:
+    """Draw a teardrop pin at (cx, cy). Tip is at (cx, cy); circle sits above."""
     original_mode = img.mode
     overlay = img.convert("RGBA")
     draw = ImageDraw.Draw(overlay, "RGBA")
-    draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), outline=color, width=width)
-    draw.line((cx - line_len, cy, cx + line_len, cy), fill=color, width=width)
-    draw.line((cx, cy - line_len, cx, cy + line_len), fill=color, width=width)
+
+    # Circle body: above the tip
+    bx = cx
+    by = cy - radius - 10
+    draw.ellipse((bx - radius, by - radius, bx + radius, by + radius), fill=color)
+    # Triangle pointing down from circle to tip
+    triangle = [
+        (bx - int(radius * 0.65), by + int(radius * 0.6)),
+        (cx, cy),
+        (bx + int(radius * 0.65), by + int(radius * 0.6)),
+    ]
+    draw.polygon(triangle, fill=color)
+    # White inner dot
+    inner_r = max(2, int(radius * 0.38))
+    draw.ellipse((bx - inner_r, by - inner_r, bx + inner_r, by + inner_r), fill=inner_color)
+
     return overlay.convert(original_mode)
+
+
+# CSS injected before screenshot to make every animation and transition
+# complete in 1ms. Elements jump straight to their end state, so we never
+# capture mid-fade or pre-reveal artifacts.
+_ANIMATION_KILL_CSS = """
+*, *::before, *::after {
+    animation-duration: 1ms !important;
+    animation-delay: 0s !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    transition-delay: 0s !important;
+    scroll-behavior: auto !important;
+}
+html { scroll-behavior: auto !important; }
+"""
+
+
+def _prefire_observers(page, target_y: int) -> None:
+    """
+    Scroll through the page from top to target_y in steps, giving any
+    IntersectionObservers along the way a chance to fire and apply their
+    reveal classes. Without this, sites with reveal-on-scroll patterns
+    (Locomotive, GSAP ScrollTrigger, AOS, etc.) leave elements at their
+    pre-reveal state when we jump directly to a deep scroll position.
+    """
+    try:
+        page.evaluate(
+            """
+            ([targetY, viewportH]) => new Promise((resolve) => {
+                const total = Math.max(targetY + viewportH, viewportH);
+                const step = Math.max(viewportH / 2, 200);
+                let pos = 0;
+                const tick = () => {
+                    window.scrollTo(0, pos);
+                    if (pos >= total) { resolve(); return; }
+                    pos += step;
+                    requestAnimationFrame(tick);
+                };
+                tick();
+            });
+            """,
+            [target_y, page.viewport_size["height"] if page.viewport_size else 720],
+        )
+    except Exception:
+        # Non-fatal: prefire is a best-effort optimization
+        pass
 
 
 def _encode(raw_png: bytes, fmt: str, quality: int) -> bytes:
