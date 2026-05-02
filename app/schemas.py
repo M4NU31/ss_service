@@ -57,6 +57,14 @@ class TaskScreenshotRequest(BaseModel):
     # Coordinates here are page (document) coordinates in pixels.
     scroll: ScrollPosition | None = None
 
+    # Optional: CSS selector of the clicked element. When provided and the
+    # element is found server-side, the pin is drawn at the element's actual
+    # viewport position (not the user-reported (x, y)). Fixes pin imprecision
+    # on sites where server rendering differs from the client (smooth scroll
+    # libraries like Lenis interpreting scrollTo as animated, image lazy
+    # loading, font swaps, etc.).
+    selector: str | None = None
+
     # Region to crop around (x, y). Omit to use the service default.
     crop_size: CropSize | None = None
 

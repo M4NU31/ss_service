@@ -142,6 +142,12 @@ class ScreenshotEngine:
                     if req.delay_ms:
                         page.wait_for_timeout(req.delay_ms)
 
+                    # Resolve the pin position. If a selector was provided and
+                    # the element is found server-side, use its actual visual
+                    # position — much more reliable than the user-reported
+                    # (x, y) on sites where server rendering differs.
+                    pin_x, pin_y = _resolve_pin_position(page, req)
+
                     raw = page.screenshot(
                         full_page=False,
                         type="png",
@@ -155,9 +161,9 @@ class ScreenshotEngine:
                 crop_h = req.crop_size.height if req.crop_size else settings.task_crop_height
 
                 if req.highlight:
-                    img = _draw_pin(img, req.x, req.y)
+                    img = _draw_pin(img, pin_x, pin_y)
                 else:
-                    img = _crop_around(img, req.x, req.y, crop_w, crop_h)
+                    img = _crop_around(img, pin_x, pin_y, crop_w, crop_h)
 
                 return _encode_pil(img, req.format, req.quality)
             except Exception as exc:
@@ -248,8 +254,9 @@ def _draw_pin(
 
 
 # CSS injected before screenshot to make every animation and transition
-# complete in 1ms. Elements jump straight to their end state, so we never
-# capture mid-fade or pre-reveal artifacts.
+# complete in 1ms and force scroll behavior to instant. Elements jump
+# straight to their end state, and scrollTo() is no longer intercepted
+# as smooth by libraries like Lenis / Locomotive Scroll.
 _ANIMATION_KILL_CSS = """
 *, *::before, *::after {
     animation-duration: 1ms !important;
@@ -259,8 +266,69 @@ _ANIMATION_KILL_CSS = """
     transition-delay: 0s !important;
     scroll-behavior: auto !important;
 }
-html { scroll-behavior: auto !important; }
+html, body {
+    scroll-behavior: auto !important;
+}
 """
+
+
+def _resolve_pin_position(page, req: "TaskScreenshotRequest") -> tuple[int, int]:
+    """
+    Determine where to draw the pin on the captured viewport.
+
+    If a selector was provided and the element is currently visible in the
+    viewport, return its actual bounding-box center. This is much more
+    reliable than the client-reported (x, y) because:
+
+      - Server rendering may differ from the user's browser (font load
+        timing, image dimensions, smooth-scroll libraries that animate
+        scrollTo even though we asked for instant).
+      - The element's true viewport position after the server's scroll
+        is whatever the layout decided, not what the client predicted.
+
+    Falls back to the client-reported (x, y) when:
+      - No selector provided
+      - Selector doesn't match anything on the server-side DOM
+      - Element is outside the viewport (e.g. its position is so different
+        that following it would crop the wrong region)
+    """
+    selector = req.selector
+    if not selector:
+        return req.x, req.y
+
+    try:
+        # Strip pseudo-element suffix; query_selector won't match those
+        sel = selector.split("::")[0].strip()
+        if not sel:
+            return req.x, req.y
+
+        rect = page.evaluate(
+            """
+            (sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return null;
+                const r = el.getBoundingClientRect();
+                return { left: r.left, top: r.top, width: r.width, height: r.height };
+            }
+            """,
+            sel,
+        )
+    except Exception:
+        return req.x, req.y
+
+    if not rect:
+        return req.x, req.y
+
+    cx = int(rect["left"] + rect["width"] / 2)
+    cy = int(rect["top"]  + rect["height"] / 2)
+
+    # Reject if the element ended up outside the viewport — likely a layout
+    # mismatch where server rendering put it somewhere different. Better to
+    # mark the user's reported click point than to point off-screen.
+    if cx < 0 or cy < 0 or cx >= req.viewport.width or cy >= req.viewport.height:
+        return req.x, req.y
+
+    return cx, cy
 
 
 def _prefire_observers(page, target_y: int) -> None:
