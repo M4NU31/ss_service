@@ -119,7 +119,7 @@ class ScreenshotEngine:
                 )
                 try:
                     page = ctx.new_page()
-                    self._navigate(page, str(req.url))
+                    self._navigate(page, str(req.url), fast=True)
 
                     # Kill all CSS animations & transitions before they paint.
                     # More aggressive than Playwright's animations="disabled"
@@ -131,18 +131,13 @@ class ScreenshotEngine:
                         # Pre-fire IntersectionObservers by scrolling through
                         # the page first. Sites with reveal-on-scroll patterns
                         # (very common) keep elements at opacity:0 / pre-transform
-                        # until their IO callback fires. Without this prefire,
-                        # those elements render blank.
+                        # until their IO callback fires.
                         _prefire_observers(page, req.scroll.y)
 
                         page.evaluate(
                             "([x, y]) => window.scrollTo(x, y)",
                             [req.scroll.x, req.scroll.y],
                         )
-                        try:
-                            page.wait_for_load_state("networkidle", timeout=5000)
-                        except Exception:
-                            page.wait_for_timeout(500)
 
                     if req.delay_ms:
                         page.wait_for_timeout(req.delay_ms)
@@ -186,10 +181,22 @@ class ScreenshotEngine:
     # Internal
     # ------------------------------------------------------------------
 
-    def _navigate(self, page, url: str) -> None:
+    def _navigate(self, page, url: str, fast: bool = False) -> None:
+        """
+        Navigate to *url*.
+
+        fast=True: wait_until="load" — DOM + initial assets done. ~1-3s
+                   faster than networkidle on sites that keep doing background
+                   network (analytics, websockets, polling). Use for task
+                   screenshots where speed matters more than every byte loaded.
+
+        fast=False: wait_until="networkidle" — wait for the page to fully
+                    settle. Use for high-fidelity full-page captures.
+        """
         timeout = settings.browser_timeout_ms
+        primary = "load" if fast else "networkidle"
         try:
-            page.goto(url, wait_until="networkidle", timeout=timeout)
+            page.goto(url, wait_until=primary, timeout=timeout)
         except Exception:
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=timeout)
@@ -258,27 +265,25 @@ html { scroll-behavior: auto !important; }
 
 def _prefire_observers(page, target_y: int) -> None:
     """
-    Scroll through the page from top to target_y in steps, giving any
-    IntersectionObservers along the way a chance to fire and apply their
-    reveal classes. Without this, sites with reveal-on-scroll patterns
-    (Locomotive, GSAP ScrollTrigger, AOS, etc.) leave elements at their
-    pre-reveal state when we jump directly to a deep scroll position.
+    Scroll through the page from top to target_y in steps so any
+    IntersectionObservers along the way fire their reveal callbacks.
+    Without this, sites with reveal-on-scroll patterns (Locomotive,
+    GSAP ScrollTrigger, AOS, etc.) leave elements at their pre-reveal
+    state when we jump directly to a deep scroll position.
+
+    Steps in viewport-height jumps (not rAF) so the whole prefire
+    completes in a few ms instead of seconds.
     """
     try:
         page.evaluate(
             """
-            ([targetY, viewportH]) => new Promise((resolve) => {
+            ([targetY, viewportH]) => {
                 const total = Math.max(targetY + viewportH, viewportH);
-                const step = Math.max(viewportH / 2, 200);
-                let pos = 0;
-                const tick = () => {
+                const step = viewportH;
+                for (let pos = 0; pos < total; pos += step) {
                     window.scrollTo(0, pos);
-                    if (pos >= total) { resolve(); return; }
-                    pos += step;
-                    requestAnimationFrame(tick);
-                };
-                tick();
-            });
+                }
+            }
             """,
             [target_y, page.viewport_size["height"] if page.viewport_size else 720],
         )
