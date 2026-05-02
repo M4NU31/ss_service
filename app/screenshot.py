@@ -134,6 +134,21 @@ class ScreenshotEngine:
                         # until their IO callback fires.
                         _prefire_observers(page, req.scroll.y)
 
+                        # Sweep the clicked element through the viewport center.
+                        # IntersectionObservers commonly use thresholds like 0.5
+                        # or rootMargin that fire only when the element is well
+                        # into view — not just barely peeking from the bottom.
+                        # An element at the bottom of the user's viewport would
+                        # never cross those thresholds at the user's scroll
+                        # position alone. Centering it forces every plausible
+                        # threshold to fire before we settle at the user's pos.
+                        _sweep_element_through_center(
+                            page,
+                            req.scroll.y,
+                            req.element_rect,
+                            req.viewport.height,
+                        )
+
                         page.evaluate(
                             "([x, y]) => window.scrollTo(x, y)",
                             [req.scroll.x, req.scroll.y],
@@ -333,6 +348,46 @@ def _align_scroll_to_element(page, req: "TaskScreenshotRequest") -> None:
         page.evaluate("(dy) => window.scrollBy(0, dy)", delta)
         page.wait_for_timeout(50)
     except Exception:
+        pass
+
+
+def _sweep_element_through_center(
+    page,
+    user_scroll_y: int,
+    element_rect: dict | None,
+    viewport_h: int,
+) -> None:
+    """
+    Force the clicked element to pass through the viewport center so any
+    IntersectionObserver-based reveal patterns (threshold 0.5+, rootMargin,
+    "in-view" libraries) fire their callback before we settle the page.
+
+    Without this, elements at the bottom of the user's viewport — barely
+    peeking in — never trigger their reveal animation on the server,
+    even though the user can see them on their browser (where they were
+    revealed earlier when scrolled past a higher position).
+    """
+    if not element_rect:
+        return
+
+    try:
+        elem_top_doc    = user_scroll_y + element_rect.get("top", 0)
+        elem_height     = element_rect.get("height", 0)
+        elem_center_doc = elem_top_doc + elem_height / 2
+        # Position needed to center the element vertically in the viewport
+        centered_scroll_y = max(0, int(elem_center_doc - viewport_h / 2))
+
+        # Skip if the user's scroll already has the element centered enough
+        # (within 100px of the centered position) — no need for the extra
+        # sweep, prefire already covers it.
+        if abs(centered_scroll_y - user_scroll_y) < 100:
+            return
+
+        page.evaluate("(y) => window.scrollTo(0, y)", centered_scroll_y)
+        # Brief settle so IO callbacks run + JS-driven class toggles propagate
+        page.wait_for_timeout(80)
+    except Exception:
+        # Non-fatal: best-effort optimization
         pass
 
 
