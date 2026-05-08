@@ -169,15 +169,18 @@ class ScreenshotEngine:
                     # so the layout is deterministic for the screenshot.
                     _freeze_animations(page)
 
-                    # If we have a selector, align the scroll so the element
-                    # ends up at the same viewport y the user reported. Smooth-
-                    # scroll libraries can leave the page mid-flight; this
-                    # final correction snaps the element into place by
-                    # adjusting scroll by the delta between the element's
-                    # actual viewport y and the requested y. Pin still draws
-                    # at user-reported (x, y) — that's exactly where they clicked.
-                    if req.selector:
-                        _align_scroll_to_element(page, req)
+                    # Re-apply the user's reported scroll position
+                    # AFTER the freeze. Finishing animations can shift
+                    # layout heights (an accordion expanding to its
+                    # final state, a hero reveal landing), and the
+                    # user's intended frame is whatever shows at their
+                    # original scroll y. The element selector that
+                    # came from the embed is metadata for the ticket
+                    # technical info — it must NOT move the scroll
+                    # away from where the user pinned, otherwise the
+                    # captured viewport won't match what they saw.
+                    if req.scroll:
+                        _force_scroll_to(page, req.scroll.y)
 
                     raw = page.screenshot(
                         full_page=False,
