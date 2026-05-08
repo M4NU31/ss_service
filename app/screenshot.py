@@ -21,7 +21,6 @@ Design:
 
 import asyncio
 import io
-import time
 from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image, ImageDraw
@@ -29,69 +28,6 @@ from playwright.sync_api import sync_playwright, Browser, Playwright
 
 from .config import settings
 from .schemas import PageScreenshotRequest, TaskScreenshotRequest
-
-
-def _wait_for_stable(page, max_wait_ms: int) -> None:
-    """
-    Wait for the page to be visually stable, capped at *max_wait_ms*.
-
-    Replaces a fixed page.wait_for_timeout(delay_ms) so the average
-    capture exits as soon as the four signals below settle (typically
-    400-900ms on real sites) instead of always paying the worst case.
-    The cap protects against pages that never go idle (long-poll
-    endpoints, infinite analytics beacons, decorative CSS animations
-    set to infinite, etc.).
-
-    Signals checked, all running against the same shared deadline:
-      1. Playwright's "networkidle" — 500ms with no in-flight requests.
-      2. document.fonts.ready — custom fonts swapped in (no FOUT).
-      3. document.getAnimations() finished — CSS/Web Animations done.
-      4. requestIdleCallback — browser has no scheduled JS pending.
-    """
-    if max_wait_ms <= 0:
-        return
-
-    deadline = time.monotonic() + (max_wait_ms / 1000.0)
-
-    def remaining_ms() -> int:
-        # Floor at 50ms so a barely-elapsed deadline still gives a tick
-        # for the JS evaluator round-trip.
-        return max(50, int((deadline - time.monotonic()) * 1000))
-
-    # 1. Network idle (Playwright primitive — most reliable signal).
-    try:
-        page.wait_for_load_state("networkidle", timeout=remaining_ms())
-    except Exception:
-        pass
-
-    # 2-4. Combined JS gate: fonts + animations + idle, each individually
-    # bounded so a single hung promise can't burn the whole budget.
-    budget = remaining_ms()
-    if budget <= 50:
-        return
-    try:
-        page.evaluate(
-            """(budget) => Promise.race([
-                Promise.all([
-                    document.fonts ? document.fonts.ready : Promise.resolve(),
-                    Promise.all(
-                        (document.getAnimations ? document.getAnimations() : [])
-                            .map(a => a.finished.catch(() => null))
-                    ),
-                    new Promise(r => {
-                        if (typeof requestIdleCallback === 'function') {
-                            requestIdleCallback(() => r(), { timeout: Math.min(budget, 600) });
-                        } else {
-                            setTimeout(r, 100);
-                        }
-                    }),
-                ]),
-                new Promise(r => setTimeout(r, budget)),
-            ])""",
-            budget,
-        )
-    except Exception:
-        pass
 
 
 class ScreenshotEngine:
@@ -158,7 +94,7 @@ class ScreenshotEngine:
                     page = ctx.new_page()
                     self._navigate(page, str(req.url))
                     if req.delay_ms:
-                        _wait_for_stable(page, req.delay_ms)
+                        page.wait_for_timeout(req.delay_ms)
                     raw = page.screenshot(
                         full_page=req.full_page,
                         type="png",
@@ -219,7 +155,7 @@ class ScreenshotEngine:
                         _force_scroll_to(page, req.scroll.y)
 
                     if req.delay_ms:
-                        _wait_for_stable(page, req.delay_ms)
+                        page.wait_for_timeout(req.delay_ms)
 
                     # If we have a selector, align the scroll so the element
                     # ends up at the same viewport y the user reported. Smooth-
