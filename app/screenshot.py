@@ -157,6 +157,18 @@ class ScreenshotEngine:
                     if req.delay_ms:
                         page.wait_for_timeout(req.delay_ms)
 
+                    # Freeze any animations still in motion before the
+                    # capture. Sites with continuous animations (GSAP
+                    # timelines, scroll-driven Lenis, parallax loops)
+                    # keep moving regardless of how long we wait — a
+                    # 2000ms vs 3000ms delay would catch different
+                    # frames of the same hero CTA. This call advances
+                    # all WAAPI animations to their final keyframes,
+                    # stops the common JS animation libraries, and
+                    # disables future requestAnimationFrame callbacks
+                    # so the layout is deterministic for the screenshot.
+                    _freeze_animations(page)
+
                     # If we have a selector, align the scroll so the element
                     # ends up at the same viewport y the user reported. Smooth-
                     # scroll libraries can leave the page mid-flight; this
@@ -289,6 +301,82 @@ html, body {
     scroll-behavior: auto !important;
 }
 """
+
+
+def _freeze_animations(page) -> None:
+    """
+    Surgically halt every animation source on the page just before the
+    screenshot so the captured frame doesn't drift between calls.
+
+    None of these touch the visual layout directly — we don't override
+    transform/opacity/filter on elements (which would break modals,
+    tooltips, off-canvas drawers, dropdowns, etc.). We just ask the
+    page's own animations to fast-forward to the keyframes the page
+    itself already declared as "final", and prevent further frames from
+    being scheduled until the screenshot fires.
+
+    Steps, in order:
+      1. document.getAnimations().finish() — advance every Web
+         Animations API entry (CSS animations, @keyframes, .animate(),
+         View Transitions) to its end keyframe and fire animationend.
+      2. Stop common JS animation libraries that drive their own loops
+         (GSAP global timeline, Lenis smooth scroll, GSAP
+         ScrollSmoother). Detected by their globals; missing libraries
+         are silently skipped.
+      3. Override requestAnimationFrame / cancelAnimationFrame to be
+         no-ops so any rAF-driven animation can't schedule a new frame
+         between this call and page.screenshot().
+      4. Pause <video> and <audio> so media frames stop ticking.
+    """
+    page.evaluate(
+        """
+        () => {
+            // 1. Force-finish all WAAPI animations.
+            try {
+                if (document.getAnimations) {
+                    document.getAnimations().forEach((a) => {
+                        try { a.finish(); } catch (_) { /* paused/canceled */ }
+                    });
+                }
+            } catch (_) { /* ignore */ }
+
+            // 2. Stop common JS animation libraries.
+            try {
+                if (window.gsap && window.gsap.globalTimeline) {
+                    window.gsap.globalTimeline.progress(1, false);
+                    window.gsap.globalTimeline.pause();
+                }
+            } catch (_) { /* ignore */ }
+            try {
+                const lenis = window.lenis || window.__lenis || window._lenis;
+                if (lenis && typeof lenis.stop === 'function') lenis.stop();
+            } catch (_) { /* ignore */ }
+            try {
+                if (window.ScrollSmoother && typeof window.ScrollSmoother.get === 'function') {
+                    const ss = window.ScrollSmoother.get();
+                    if (ss && typeof ss.kill === 'function') ss.kill();
+                }
+            } catch (_) { /* ignore */ }
+            // Framer Motion exposes no global kill switch, but its
+            // animations are WAAPI-based and already covered by step 1.
+
+            // 3. Freeze rAF — any pending callback runs once if it was
+            //    already in the queue, but no NEW frames can be
+            //    scheduled.
+            try {
+                window.requestAnimationFrame = function () { return 0; };
+                window.cancelAnimationFrame  = function () {};
+            } catch (_) { /* ignore */ }
+
+            // 4. Pause media so video/audio frames don't advance.
+            try {
+                document.querySelectorAll('video, audio').forEach((el) => {
+                    try { el.pause(); } catch (_) {}
+                });
+            } catch (_) { /* ignore */ }
+        }
+        """
+    )
 
 
 def _align_scroll_to_element(page, req: "TaskScreenshotRequest") -> None:
