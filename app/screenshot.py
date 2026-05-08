@@ -391,6 +391,13 @@ def _align_scroll_to_element(page, req: "TaskScreenshotRequest") -> None:
     client, regardless of whether the smooth-scroll library finished its
     animation, font swaps shifted layout, etc.
 
+    Critical detail: if the selector matches multiple elements (e.g.
+    a list of service cards that all share the same class signature),
+    we score each candidate by rect similarity to the client's reported
+    rect (left, width, height) and pick the closest match. Picking the
+    first match — which is what plain querySelector returns — frequently
+    pointed at an earlier sibling and yielded a several-row pin offset.
+
     The pin still draws at the user's reported (x, y) — that's the point
     they actually clicked. We're only correcting WHAT'S SHOWN at that
     point, not where the pin goes.
@@ -405,15 +412,43 @@ def _align_scroll_to_element(page, req: "TaskScreenshotRequest") -> None:
         if not sel:
             return
 
+        # Resolve the candidate element by querying ALL matches and
+        # choosing the one whose rect (left, width, height) best matches
+        # the client's. Top is excluded from the similarity score
+        # because that's the value we're trying to align — it's the
+        # delta itself.
         server_top = page.evaluate(
             """
-            (sel) => {
-                const el = document.querySelector(sel);
-                if (!el) return null;
-                return el.getBoundingClientRect().top;
+            ({ sel, want }) => {
+                let nodes;
+                try { nodes = document.querySelectorAll(sel); }
+                catch (_) { return null; }
+                if (!nodes || nodes.length === 0) return null;
+
+                if (nodes.length === 1) {
+                    return nodes[0].getBoundingClientRect().top;
+                }
+
+                let best = null;
+                let bestScore = Infinity;
+                for (const node of nodes) {
+                    const r = node.getBoundingClientRect();
+                    // Tighter weights on dimensions than position so a
+                    // sibling at a different scroll offset still beats
+                    // a same-position element of a different size.
+                    const score =
+                        Math.abs(r.left   - (want.left   ?? r.left))   * 1 +
+                        Math.abs(r.width  - (want.width  ?? r.width))  * 2 +
+                        Math.abs(r.height - (want.height ?? r.height)) * 2;
+                    if (score < bestScore) {
+                        bestScore = score;
+                        best = r;
+                    }
+                }
+                return best ? best.top : null;
             }
             """,
-            sel,
+            { "sel": sel, "want": client_rect },
         )
     except Exception:
         return
