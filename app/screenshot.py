@@ -128,34 +128,54 @@ class ScreenshotEngine:
                     page.add_style_tag(content=_ANIMATION_KILL_CSS)
 
                     if req.scroll:
-                        # Pre-fire IntersectionObservers by scrolling through
-                        # the page first. Sites with reveal-on-scroll patterns
-                        # (very common) keep elements at opacity:0 / pre-transform
-                        # until their IO callback fires.
-                        _prefire_observers(page, req.scroll.y)
-
-                        # Sweep the clicked element through the viewport center.
-                        # IntersectionObservers commonly use thresholds like 0.5
-                        # or rootMargin that fire only when the element is well
-                        # into view — not just barely peeking from the bottom.
-                        # An element at the bottom of the user's viewport would
-                        # never cross those thresholds at the user's scroll
-                        # position alone. Centering it forces every plausible
-                        # threshold to fire before we settle at the user's pos.
-                        _sweep_element_through_center(
-                            page,
-                            req.scroll.y,
-                            req.element_rect,
-                            req.viewport.height,
+                        # Skip prefire + sweep when the clicked element
+                        # was already in the initial above-fold viewport
+                        # at user scroll = 0..viewport.height. In that
+                        # case any IntersectionObserver would have fired
+                        # at navigation time, and the element is already
+                        # in viewport so the sweep would short-circuit
+                        # anyway. Saves 200-500ms on shallow clicks.
+                        elem_doc_top = req.scroll.y + (
+                            req.element_rect.get("top", 0) if req.element_rect else 0
                         )
+                        needs_prefire = elem_doc_top >= req.viewport.height
+
+                        if needs_prefire:
+                            # Pre-fire IntersectionObservers by scrolling
+                            # through the page first. Sites with reveal-
+                            # on-scroll patterns keep elements at opacity:0
+                            # / pre-transform until their IO callback fires.
+                            _prefire_observers(page, req.scroll.y)
+
+                            # Sweep the clicked element through the
+                            # viewport center. IntersectionObservers
+                            # commonly use thresholds like 0.5 or
+                            # rootMargin that fire only when the element
+                            # is well into view. Centering it forces every
+                            # plausible threshold to fire before we settle.
+                            _sweep_element_through_center(
+                                page,
+                                req.scroll.y,
+                                req.element_rect,
+                                req.viewport.height,
+                            )
 
                         # Final scroll to the user's actual position, using
                         # the force-scroll path so smooth-scroll libraries
                         # don't animate to it (we'd screenshot mid-animation).
                         _force_scroll_to(page, req.scroll.y)
 
-                    if req.delay_ms:
-                        page.wait_for_timeout(req.delay_ms)
+                    # Smart settle replaces a fixed wait_for_timeout. With
+                    # _freeze_animations handling animation determinism just
+                    # before the screenshot, the only thing the wait was
+                    # actually doing was giving fonts and visible images
+                    # time to finish loading. We wait on those *as
+                    # conditions* (fonts.ready, networkidle bounded,
+                    # above-fold image decode) instead of on a worst-case
+                    # 3s timer. Light pages settle in 300-600ms; heavy ones
+                    # cap at the bound. delay_ms is reused as the upper
+                    # bound — same wire contract, faster typical case.
+                    _smart_settle(page, max_ms=req.delay_ms or 1500)
 
                     # Freeze any animations still in motion before the
                     # capture. Sites with continuous animations (GSAP
@@ -238,16 +258,23 @@ class ScreenshotEngine:
         """
         Navigate to *url*.
 
-        fast=True: wait_until="load" — DOM + initial assets done. ~1-3s
-                   faster than networkidle on sites that keep doing background
-                   network (analytics, websockets, polling). Use for task
-                   screenshots where speed matters more than every byte loaded.
+        fast=True: wait_until="domcontentloaded" — return as soon as
+                   the HTML is parsed and DOM is constructed. Fonts,
+                   images, and late stylesheets are NOT awaited here
+                   because _smart_settle() does that with adaptive
+                   condition-driven waits afterwards. Trying to wait
+                   for "load" inside goto adds 500-1500ms on sites
+                   with many synchronous third-party scripts (pixel
+                   trackers, analytics) without buying us anything
+                   that smart_settle won't already cover. Use for
+                   task screenshots where time-to-capture matters.
 
-        fast=False: wait_until="networkidle" — wait for the page to fully
-                    settle. Use for high-fidelity full-page captures.
+        fast=False: wait_until="networkidle" — wait for the page to
+                    fully settle. Use for high-fidelity full-page
+                    captures where every byte matters.
         """
         timeout = settings.browser_timeout_ms
-        primary = "load" if fast else "networkidle"
+        primary = "domcontentloaded" if fast else "networkidle"
         try:
             page.goto(url, wait_until=primary, timeout=timeout)
         except Exception:
@@ -317,6 +344,59 @@ html, body {
     scroll-behavior: auto !important;
 }
 """
+
+
+def _smart_settle(page, max_ms: int = 1500) -> None:
+    """
+    Adaptive page-settle wait. Replaces a fixed wait_for_timeout call.
+
+    The previous flow waited a fixed 3000ms after navigation as a
+    worst-case margin for fonts to swap and images to decode. With
+    _freeze_animations() now running just before the screenshot,
+    animation drift is no longer a concern, so the wait is purely
+    about resource loading. We can drive that on conditions instead
+    of a timer — light sites finish in 300-600ms, heavy sites cap at
+    *max_ms*.
+
+    Steps:
+      1. document.fonts.ready — resolves the moment all CSS-loaded
+         fonts are decoded. Typically 100-400ms; instant if cached.
+      2. networkidle bounded by *max_ms* — many sites poll analytics
+         and never go idle, so we cap the wait. Soft-fail.
+      3. Above-fold images decoded — only the imgs currently in the
+         viewport block the screenshot; off-screen lazy images don't
+         affect what gets captured. Uses Image.decode() which awaits
+         the actual pixel decode, not just the network fetch.
+
+    All three steps are best-effort: any failure is swallowed because
+    the screenshot can still proceed (the freeze + force-scroll +
+    align run regardless).
+    """
+    try:
+        page.evaluate("async () => { await document.fonts.ready; }")
+    except Exception:
+        pass
+    try:
+        page.wait_for_load_state("networkidle", timeout=max_ms)
+    except Exception:
+        # networkidle is best-effort — most marketing sites have
+        # enough background polling that they never reach idle.
+        pass
+    try:
+        page.evaluate(
+            """
+            async () => {
+                const imgs = [...document.querySelectorAll('img')].filter((i) => {
+                    if (i.complete && i.naturalWidth > 0) return false;
+                    const r = i.getBoundingClientRect();
+                    return r.bottom > 0 && r.top < window.innerHeight;
+                });
+                await Promise.all(imgs.map((i) => i.decode().catch(() => null)));
+            }
+            """
+        )
+    except Exception:
+        pass
 
 
 def _freeze_animations(page) -> None:
