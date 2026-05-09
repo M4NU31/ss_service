@@ -182,6 +182,19 @@ class ScreenshotEngine:
                     if req.scroll:
                         _force_scroll_to(page, req.scroll.y)
 
+                    # Correct server-side layout drift. Even at the
+                    # exact requested scrollY, the page often renders
+                    # ~hundreds of pixels off vertically vs the user's
+                    # browser (fonts not swapped yet, images at a
+                    # different load state, hero CTA still mid-reveal,
+                    # etc). Diagnostic on Muon Space confirmed:
+                    # requested=2101, actual.htmlScroll=2101 ✓ but the
+                    # clicked element landed at viewport y=824 server
+                    # vs y=436 on the client — 388px off. Aligning by
+                    # element rect fixes that without moving the pin
+                    # (the pin still draws at the user's reported x,y).
+                    _align_scroll_to_element(page, req)
+
                     # TEMP DIAGNOSTIC: distinguish between Lenis
                     # re-asserting scroll (actual ≠ requested) and
                     # server-side layout drift (actual == requested
