@@ -195,44 +195,6 @@ class ScreenshotEngine:
                     # (the pin still draws at the user's reported x,y).
                     _align_scroll_to_element(page, req)
 
-                    # TEMP DIAGNOSTIC: distinguish between Lenis
-                    # re-asserting scroll (actual ≠ requested) and
-                    # server-side layout drift (actual == requested
-                    # but the element lands at a different viewport y
-                    # than the client reported).
-                    try:
-                        diag = page.evaluate(
-                            """
-                            (sel) => {
-                                let elTop = null;
-                                if (sel) {
-                                    try {
-                                        const n = document.querySelector(sel);
-                                        if (n) elTop = n.getBoundingClientRect().top;
-                                    } catch (_) {}
-                                }
-                                return {
-                                    htmlScroll: document.documentElement.scrollTop,
-                                    bodyScroll: document.body.scrollTop,
-                                    winScroll:  window.scrollY,
-                                    docHeight:  document.documentElement.scrollHeight,
-                                    elTop,
-                                };
-                            }
-                            """,
-                            (req.selector or "").split("::")[0].strip() or None,
-                        )
-                        print(
-                            "[ss_service/task] pre-shot",
-                            "requested_scroll=", req.scroll.y if req.scroll else None,
-                            "actual=", diag,
-                            "client_elTop=", req.element_rect.get("top") if req.element_rect else None,
-                            "client_y=", req.y,
-                            flush=True,
-                        )
-                    except Exception as exc:
-                        print("[ss_service/task] diag failed:", exc, flush=True)
-
                     raw = page.screenshot(
                         full_page=False,
                         type="png",
