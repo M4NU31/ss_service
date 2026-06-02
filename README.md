@@ -1,81 +1,66 @@
 # Screenshot Service (`ss_service`)
 
-Headless browser screenshot microservice for [Punch - Site QA Tool](https://github.com/M4NU41/pbg). Built with FastAPI and Playwright/Chromium.
+Headless browser screenshot microservice for [Punch Site QA](../punch-siteqa-backend). The embed widget never takes its own screenshots — it asks the backend, which proxies to this service. Built with FastAPI + Playwright/Chromium.
 
 ---
 
-## Features
-
-- **Page screenshot** — full-page or viewport capture of any URL
-- **Task screenshot** — crop or highlight around a specific `(x, y)` coordinate
-- **Dual mode** — returns both a close-up crop and a full viewport with crosshair as base64 JSON
-- **API key auth** — optional bearer key via `X-API-Key` header
-- **Rate limiting** — configurable requests per window
-- **Health endpoint** — `/health` for container probes
-
----
-
-## Quick Start (Docker)
+## Run locally
 
 ```bash
-git clone https://github.com/M4NU41/ss_service.git
-cd ss_service
-cp .env.example .env   # adjust if needed
+# Docker (recommended)
+cp .env.example .env
 docker compose up --build
-```
 
-Service available at [http://localhost:8000](http://localhost:8000).  
-API docs at [http://localhost:8000/docs](http://localhost:8000/docs).
-
----
-
-## Manual Setup
-
-### Prerequisites
-- Python 3.12+
-- pip
-
-### Install
-
-```bash
+# Manual
 pip install -r requirements.txt
 playwright install chromium
-```
-
-### Run
-
-```bash
 python run.py
 ```
 
+Serves on `:8000`. Swagger at `/docs`, healthcheck at `/health`.
+
+**Docker note:** `shm_size: 1gb` is set in `docker-compose.yml` and is required — Chromium crashes without it. Only one Uvicorn worker by design (the Playwright browser singleton is not thread-safe); scale horizontally with replicas.
+
 ---
 
-## Environment Variables
+## Deploy
 
-| Variable | Default | Description |
+Runs on its own DigitalOcean droplet. On the droplet:
+
+```bash
+cd /root/ss_service
+git pull origin main
+docker compose up -d --build
+```
+
+The backend reaches it via `SCREENSHOT_SERVICE_URL` env var, with `SCREENSHOT_SERVICE_API_KEY` for auth.
+
+---
+
+## Env vars
+
+| Variable | Default | Purpose |
 |---|---|---|
-| `BROWSER_MAX_CONCURRENT` | `5` | Max concurrent browser sessions |
-| `BROWSER_TIMEOUT_MS` | `30000` | Page load timeout in ms |
-| `BROWSER_ENGINE` | `chromium` | Browser engine |
-| `DEFAULT_VIEWPORT_WIDTH` | `1280` | Default viewport width |
-| `DEFAULT_VIEWPORT_HEIGHT` | `720` | Default viewport height |
-| `DEFAULT_JPEG_QUALITY` | `80` | JPEG output quality (1–100) |
-| `TASK_CROP_WIDTH` | `600` | Crop width around task pin |
-| `TASK_CROP_HEIGHT` | `400` | Crop height around task pin |
-| `API_KEY` | *(empty)* | Leave empty to disable auth |
-| `RATE_LIMIT_ENABLED` | `true` | Enable rate limiting |
-| `RATE_LIMIT_REQUESTS` | `60` | Max requests per window |
-| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate limit window in seconds |
+| `BROWSER_MAX_CONCURRENT` | `5` | Max simultaneous Chromium contexts |
+| `BROWSER_TIMEOUT_MS` | `30000` | Navigation timeout |
+| `BROWSER_ENGINE` | `chromium` | `chromium` / `firefox` / `webkit` |
+| `DEFAULT_VIEWPORT_WIDTH/HEIGHT` | `1280` / `720` | Viewport size |
+| `DEFAULT_JPEG_QUALITY` | `80` | JPEG quality 1–100 |
+| `TASK_CROP_WIDTH/HEIGHT` | `600` / `400` | Crop window around the pin (only used when `highlight=false`) |
+| `API_KEY` | *(empty)* | If set, requests need `X-API-Key` header. Empty = open (rely on network ACL) |
+| `RATE_LIMIT_ENABLED` | `true` | Per-IP sliding window |
+| `RATE_LIMIT_REQUESTS` | `60` | Per `RATE_LIMIT_WINDOW_SECONDS` |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Window duration |
 
 ---
 
-## API Endpoints
+## Endpoints
 
 ### `GET /health`
-Liveness probe. Returns `{ "status": "ok" }`.
+`{ "status": "ok" }`. Used by docker healthcheck.
 
 ### `POST /screenshot/page`
-Capture a full-page or viewport screenshot.
+Full-page or viewport screenshot.
 
 ```json
 {
@@ -86,35 +71,74 @@ Capture a full-page or viewport screenshot.
   "viewport_height": 720
 }
 ```
+Returns binary `image/jpeg` (or `png`).
 
 ### `POST /screenshot/task`
-Capture a screenshot focused on a click coordinate.
+Screenshot focused on a `(x, y)` pin. Used by the Punch backend for every embed-widget bug report.
 
 ```json
 {
   "url": "https://example.com",
+  "viewport": { "width": 1280, "height": 720 },
   "x": 400,
   "y": 300,
-  "scroll": 0,
-  "dual": false,
-  "format": "jpeg"
+  "scroll": { "x": 0, "y": 0 },
+
+  "selector": "main .hero .cta",
+  "element_rect": { "top": 100, "left": 80, "width": 200, "height": 60 },
+
+  "highlight": true,
+  "crop_size": { "width": 1280, "height": 720 },
+
+  "delay_ms": 3000,
+  "format": "jpeg",
+  "quality": 85
 }
 ```
 
-Set `dual: true` to get both cropped and full images as base64 in a single JSON response.
+Fields beyond the basic `url`/`x`/`y`:
+- **`selector` + `element_rect`** — scroll-drift correction for sites with custom scrollers (Lenis, Locomotive, libraries that hijack `window.scroll`). If the captured element ends up at a different on-screen position than `element_rect` claimed, the engine re-aligns before cropping.
+- **`highlight: true`** — skips the default crop around `(x, y)` and instead draws a pin on top of the full viewport, returning the full viewport-sized image. Default behavior in the Punch flow.
+- **`crop_size`** — defensive override that matches the viewport (so a future change to default crop behavior doesn't silently start cropping highlighted captures).
+- **`delay_ms`** — settle time after navigation. The backend floors this at 3000 ms; the engine itself runs `_freeze_animations()` (advances all WAAPI animations to their final keyframe and disables `requestAnimationFrame`) right before capture so the result is deterministic regardless of how long we waited.
+- **`format`** / **`quality`** — output controls.
+
+Returns binary image. `dual: true` mode returns JSON `{ cropped, full }` as base64 — not used by the current Punch flow but kept for legacy / debugging.
 
 ---
 
-## Integration with PBG
+## How the engine handles tricky pages
 
-In your PBG `.env`, set:
+- **URL allowlist** — `app/security.py:validate_url()` blocks loopback and private IPs to prevent SSRF.
+- **Animation freeze** — every WAAPI animation is fast-forwarded to its end keyframe and `requestAnimationFrame` is replaced with a no-op right before screenshot. This makes captures deterministic on pages with heavy GSAP / Framer Motion / CSS keyframes.
+- **Custom-scroll sites** — the backend tells us the precise `(scroll.x, scroll.y)` the user saw plus the `element_rect` they clicked on. We scroll to that position, then verify the element landed where the client said it would; if not, we nudge before cropping.
+- **Lazy-loaded content** — `delay_ms` (floored at 3000 ms by the backend) is your knob if a site streams content after `domcontentloaded`.
 
-```env
-SCREENSHOT_SERVICE_URL=http://<ss_service_host>:8000
+---
+
+## Project structure
+
+```
+app/
+├── main.py        FastAPI app, lifespan (browser start/stop), endpoints
+├── screenshot.py  ScreenshotEngine — Playwright logic, animation freeze, drift correction
+├── schemas.py     Pydantic request/response models
+├── config.py      Settings (env vars with defaults)
+├── security.py    URL validation
+└── middleware.py  Rate limiting (in-memory sliding window per IP)
+run.py             Manual entry point
+Dockerfile         Multi-stage: builder → slim runtime, non-root user
+docker-compose.yml shm_size: 1gb (critical for Chromium)
 ```
 
-If `API_KEY` is set in ss_service, also add:
+---
+
+## Integration
+
+The Punch backend calls this service from `src/routes/embed.ts:281` (`POST /embed/screenshot`). The widget never reaches this service directly — the backend signs and rate-limits all calls.
 
 ```env
-SCREENSHOT_SERVICE_API_KEY=<your-key>
+# punch-siteqa-backend/.env
+SCREENSHOT_SERVICE_URL=http://<ss_service_host>:8000
+SCREENSHOT_SERVICE_API_KEY=<value of API_KEY here>
 ```
