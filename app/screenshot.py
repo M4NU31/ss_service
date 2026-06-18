@@ -357,10 +357,64 @@ def _freeze_animations(page) -> None:
             } catch (_) { /* ignore */ }
 
             // 2. Stop common JS animation libraries.
+            // GSAP specifically needs three things, in order:
+            //   2a. ScrollTrigger.refresh() — forces every trigger to
+            //       re-measure its element. Without this, an element
+            //       whose layout shifted after the initial setup
+            //       (font swap, lazy image, etc.) will still be using
+            //       stale measurements when we progress(1) it below.
+            //   2b. Iterate every ScrollTrigger and progress its
+            //       animation to 1. ScrollTrigger animations are NOT
+            //       attached to gsap.globalTimeline — they live in
+            //       isolated tweens that only run when the user
+            //       scrolls into them. Headless browsers never trigger
+            //       that, so elements with "fade in on scroll" stay
+            //       hidden (opacity:0 / transform:translateY) unless
+            //       we manually push each one to its end state.
+            //   2c. Progress the global timeline + walk every nested
+            //       child timeline. Pages that call gsap.from() at
+            //       load (no ScrollTrigger) live here. The walk covers
+            //       gsap.timeline() instances nested inside masters.
             try {
-                if (window.gsap && window.gsap.globalTimeline) {
-                    window.gsap.globalTimeline.progress(1, false);
-                    window.gsap.globalTimeline.pause();
+                if (window.gsap) {
+                    if (window.ScrollTrigger && typeof window.ScrollTrigger.getAll === 'function') {
+                        try { window.ScrollTrigger.refresh(true); } catch (_) {}
+                        window.ScrollTrigger.getAll().forEach((t) => {
+                            try {
+                                if (t.animation && typeof t.animation.progress === 'function') {
+                                    t.animation.progress(1, false).pause();
+                                }
+                            } catch (_) {}
+                        });
+                    }
+                    if (window.gsap.globalTimeline) {
+                        try {
+                            window.gsap.globalTimeline.progress(1, false).pause();
+                        } catch (_) {}
+                        const walk = (tl) => {
+                            try {
+                                const children = (typeof tl.getChildren === 'function')
+                                    ? tl.getChildren(false, true, true)
+                                    : [];
+                                children.forEach((c) => {
+                                    try { c.progress(1, false); } catch (_) {}
+                                    if (c && typeof c.getChildren === 'function') walk(c);
+                                });
+                            } catch (_) {}
+                        };
+                        walk(window.gsap.globalTimeline);
+                    }
+                }
+            } catch (_) { /* ignore */ }
+            // Legacy GSAP v1/v2 (TweenLite / TweenMax) — pre-3.x sites
+            // still use these globals; force every active tween to its
+            // end via killAll(complete=true, tweens=true, delayedCalls=true).
+            try {
+                if (window.TweenLite && typeof window.TweenLite.killAll === 'function') {
+                    window.TweenLite.killAll(true, true, true);
+                }
+                if (window.TweenMax && typeof window.TweenMax.killAll === 'function') {
+                    window.TweenMax.killAll(true, true, true);
                 }
             } catch (_) { /* ignore */ }
             try {
