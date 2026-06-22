@@ -95,6 +95,13 @@ class ScreenshotEngine:
                     self._navigate(page, str(req.url))
                     if req.delay_ms:
                         page.wait_for_timeout(req.delay_ms)
+                    # Same freeze the task path uses: forces every
+                    # WAAPI animation to its end keyframe, walks the
+                    # GSAP global timeline + ScrollTrigger, pauses
+                    # rAF + media. Without this, project previews of
+                    # GSAP-heavy sites came back with hero text or
+                    # cards stuck mid-reveal (opacity:0 / translateY).
+                    _freeze_animations(page)
                     raw = page.screenshot(
                         full_page=req.full_page,
                         type="png",
